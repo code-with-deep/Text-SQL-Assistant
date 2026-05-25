@@ -1,11 +1,19 @@
 import os
 from pathlib import Path
 
-from decouple import config, Csv
+from decouple import Config, RepositoryEnv, Csv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Explicitly load .env from the backend directory
+config = Config(RepositoryEnv(BASE_DIR / '.env'))
+
+# SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config('DJANGO_SECRET_KEY', default='insecure-dev-key-change-in-production')
+
+# Dedicated secret key for JWT signing
+JWT_SECRET_KEY = config('JWT_SECRET_KEY', default=SECRET_KEY)
+
 DEBUG = config('DJANGO_DEBUG', default=True, cast=bool)
 ALLOWED_HOSTS = config('DJANGO_ALLOWED_HOSTS', default='localhost,127.0.0.1,0.0.0.0', cast=Csv())
 
@@ -53,28 +61,32 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
+import dj_database_url
+
+is_supabase_pooler = 'pooler.supabase' in config('DATABASE_URL', default='')
+
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': config('POSTGRES_DB', default='ecommerce_db'),
-        'USER': config('POSTGRES_USER', default='django_admin'),
-        'PASSWORD': config('POSTGRES_PASSWORD', default='django_secret_2025'),
-        'HOST': config('POSTGRES_HOST', default='localhost'),
-        'PORT': config('POSTGRES_PORT', default=5432, cast=int),
-        'CONN_MAX_AGE': 60,
-    },
-    'readonly': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': config('POSTGRES_DB', default='ecommerce_db'),
-        'USER': config('READONLY_DB_USER', default='readonly_user'),
-        'PASSWORD': config('READONLY_DB_PASSWORD', default='readonly_secret_2025'),
-        'HOST': config('POSTGRES_HOST', default='localhost'),
-        'PORT': config('POSTGRES_PORT', default=5432, cast=int),
-        'OPTIONS': {
-            'options': '-c default_transaction_read_only=on',
-        },
-    },
+    'default': dj_database_url.config(
+        default=config('DATABASE_URL', default=''),
+        conn_max_age=0 if is_supabase_pooler else 600,
+        conn_health_checks=True,
+        ssl_require=config('DATABASE_URL', default='').startswith('postgres'),
+    ),
 }
+if DATABASES['default'].get('ENGINE') == 'django.db.backends.postgresql':
+    DATABASES['default']['OPTIONS'] = DATABASES['default'].get('OPTIONS', {})
+    DATABASES['default']['OPTIONS']['prepare_threshold'] = None
+
+# The backend will default to the primary DB. If READONLY_DATABASE_URL is provided, it uses that instead.
+DATABASES['readonly'] = dj_database_url.config(
+    default=config('READONLY_DATABASE_URL', default=config('DATABASE_URL', default='')),
+    conn_max_age=0 if is_supabase_pooler else 600,
+    conn_health_checks=True,
+    ssl_require=config('READONLY_DATABASE_URL', default=config('DATABASE_URL', default='')).startswith('postgres'),
+)
+if DATABASES['readonly'].get('ENGINE') == 'django.db.backends.postgresql':
+    DATABASES['readonly']['OPTIONS'] = DATABASES['readonly'].get('OPTIONS', {})
+    DATABASES['readonly']['OPTIONS']['prepare_threshold'] = None
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
@@ -94,6 +106,12 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'sql_assistant.authentication.JWTAuthentication',
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
     'DEFAULT_RENDERER_CLASSES': [
@@ -101,9 +119,11 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
     ],
     'DEFAULT_THROTTLE_RATES': {
         'anon': f'{config("RATE_LIMIT_PER_MIN", default=30, cast=int)}/min',
+        'user': f'{config("RATE_LIMIT_PER_MIN", default=30, cast=int)}/min',
     },
     'EXCEPTION_HANDLER': 'sql_assistant.views.custom_exception_handler',
 }

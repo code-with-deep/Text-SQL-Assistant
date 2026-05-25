@@ -22,7 +22,8 @@ class ExportEngine:
             writer.writerow(columns)
             
             # Write data rows
-            writer.writerows(rows)
+            formatted_rows = [[row.get(col) for col in columns] for row in rows]
+            writer.writerows(formatted_rows)
             
             logger.info("CSV export completed: %d rows", len(rows))
             return output.getvalue().encode('utf-8')
@@ -71,7 +72,8 @@ class ExportEngine:
             
             # Write data rows
             for row_idx, row in enumerate(rows, 2):
-                for col_idx, val in enumerate(row, 1):
+                for col_idx, col_name in enumerate(columns, 1):
+                    val = row.get(col_name)
                     cell = ws.cell(row=row_idx, column=col_idx, value=val)
                     cell.font = data_font
                     cell.border = thin_border

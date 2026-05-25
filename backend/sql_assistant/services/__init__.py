@@ -7,6 +7,8 @@ from .chart_detector import ChartDetector
 from .conversation_mgr import ConversationManager
 from .suggestion_generator import SuggestionGenerator
 from .export_engine import ExportEngine
+from .intent_detector import IntentDetector
+from .seed_user_data import UserDataSeeder
 
 __all__ = [
     'SchemaInspector',
@@ -18,4 +20,6 @@ __all__ = [
     'ConversationManager',
     'SuggestionGenerator',
     'ExportEngine',
+    'IntentDetector',
+    'UserDataSeeder',
 ]

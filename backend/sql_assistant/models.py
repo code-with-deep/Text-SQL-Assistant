@@ -1,9 +1,17 @@
 import uuid
+from django.conf import settings
 from django.db import models
 
 
 class QueryHistory(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name='query_history',
+    )
     question = models.TextField()
     generated_sql = models.TextField()
     explanation = models.TextField(blank=True)
@@ -23,6 +31,7 @@ class QueryHistory(models.Model):
         db_table = 'query_history'
         ordering = ['-created_at']
         indexes = [
+            models.Index(fields=['user', 'created_at'], name='query_histo_user_id_2f4f6b_idx'),
             models.Index(fields=['is_favorite']),
             models.Index(fields=['created_at']),
         ]
@@ -33,6 +42,13 @@ class QueryHistory(models.Model):
 
 class ConversationSession(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name='conversation_sessions',
+    )
     context = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

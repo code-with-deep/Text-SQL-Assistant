@@ -8,6 +8,24 @@ logger = logging.getLogger('sql_assistant')
 SCHEMA_CACHE_KEY = 'introspected_schema'
 SUMMARY_CACHE_KEY = 'schema_prompt_summary'
 
+# Django/internal tables to exclude from introspection
+EXCLUDED_TABLES = {
+    'django_migrations', 'django_content_type',
+    'auth_group', 'auth_group_permissions', 'auth_permission',
+    'auth_user', 'auth_user_groups', 'auth_user_user_permissions',
+    'django_admin_log', 'django_session',
+    'query_history', 'conversation_sessions',
+    'sqlite_sequence',
+}
+
+# Tables that have a user_id column
+USER_SCOPED_TABLES = {'customers', 'products', 'orders', 'reviews'}
+
+
+def _readonly_alias():
+    """Return the alias to use for read-only queries."""
+    return 'readonly' if 'readonly' in settings.DATABASES else 'default'
+
 
 class SchemaInspector:
 
@@ -34,14 +52,22 @@ class SchemaInspector:
     def refresh(self):
         return self.get_schema(force_refresh=True)
 
-    def get_table_detail(self, table_name):
+    def get_table_detail(self, table_name, user_id=None):
+        """
+        Returns detailed table info including preview rows and column stats.
+        If user_id is given and the table is user-scoped, data is filtered.
+        """
         schema = self.get_schema()
         table = schema.get('tables', {}).get(table_name)
         if not table:
             return None
 
-        with connections['readonly'].cursor() as cursor:
-            cursor.execute(f'SELECT * FROM "{table_name}" LIMIT 10')
+        ro_alias = _readonly_alias()
+        is_user_scoped = table_name.lower() in USER_SCOPED_TABLES and user_id is not None
+        where_clause = f'WHERE "user_id" = {int(user_id)}' if is_user_scoped else ''
+
+        with connections[ro_alias].cursor() as cursor:
+            cursor.execute(f'SELECT * FROM "{table_name}" {where_clause} LIMIT 10')
             columns = [col[0] for col in cursor.description]
             preview_rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
@@ -50,11 +76,13 @@ class SchemaInspector:
                 col_name = col_info['name']
                 col_type = col_info['type']
                 try:
-                    if col_type in ('integer', 'bigint', 'smallint', 'numeric', 'double precision', 'real'):
+                    if col_type in ('integer', 'bigint', 'smallint', 'numeric',
+                                    'double precision', 'real', 'INTEGER',
+                                    'REAL', 'NUMERIC'):
                         cursor.execute(
                             f'SELECT MIN("{col_name}"), MAX("{col_name}"), '
-                            f'AVG("{col_name}"::numeric), COUNT(*) - COUNT("{col_name}"), '
-                            f'COUNT(DISTINCT "{col_name}") FROM "{table_name}"'
+                            f'AVG("{col_name}"::double precision), COUNT(*) - COUNT("{col_name}"), '
+                            f'COUNT(DISTINCT "{col_name}") FROM "{table_name}" {where_clause}'
                         )
                         row = cursor.fetchone()
                         stats[col_name] = {
@@ -67,37 +95,68 @@ class SchemaInspector:
                     else:
                         cursor.execute(
                             f'SELECT COUNT(*) - COUNT("{col_name}"), '
-                            f'COUNT(DISTINCT "{col_name}") FROM "{table_name}"'
+                            f'COUNT(DISTINCT "{col_name}") FROM "{table_name}" {where_clause}'
                         )
                         row = cursor.fetchone()
                         stats[col_name] = {
                             'null_count': row[0],
                             'unique_count': row[1],
                         }
+
+                    # Merge statistics directly into col_info for frontend mapping
+                    col_stats = stats[col_name]
+                    col_info['min_value'] = col_stats.get('min')
+                    col_info['max_value'] = col_stats.get('max')
+                    col_info['avg_value'] = col_stats.get('avg')
+                    col_info['null_values_count'] = col_stats.get('null_count')
+                    col_info['unique_values_count'] = col_stats.get('unique_count')
+
+                    # If this column is categorical or enum-like, query distribution percentages
+                    if col_info.get('enum_values') or (col_stats.get('unique_count') is not None and 1 < col_stats['unique_count'] <= 15):
+                        # Get user-scoped row count for percentage calculation
+                        cursor.execute(f'SELECT COUNT(*) FROM "{table_name}" {where_clause}')
+                        total_rows = cursor.fetchone()[0] or 1
+                        cursor.execute(
+                            f'SELECT "{col_name}", COUNT(*), '
+                            f'(COUNT(*)::double precision / %s) * 100 '
+                            f'FROM "{table_name}" {where_clause} '
+                            f'GROUP BY "{col_name}" '
+                            f'ORDER BY COUNT(*) DESC LIMIT 15',
+                            [total_rows]
+                        )
+                        col_info['value_distribution'] = [
+                            {
+                                'value': str(r[0]) if r[0] is not None else 'NULL',
+                                'count': r[1],
+                                'percentage': round(r[2], 2)
+                            }
+                            for r in cursor.fetchall()
+                        ]
+                    else:
+                        col_info['value_distribution'] = []
+
                 except Exception:
                     stats[col_name] = {}
 
-        table['preview_rows'] = preview_rows
-        table['column_stats'] = stats
-        return table
+        detailed_table = {
+            **table,
+            'name': table_name,
+            'column_count': len(table.get('columns', [])),
+            'preview_rows': preview_rows,
+            'column_stats': stats,
+        }
+        return detailed_table
+
+    # ------------------------------------------------------------------
+    # Introspection (PostgreSQL via information_schema)
+    # ------------------------------------------------------------------
 
     def _introspect(self):
         tables = {}
         relationships = []
 
-        with connections['readonly'].cursor() as cursor:
-            cursor.execute("""
-                SELECT table_name FROM information_schema.tables
-                WHERE table_schema = 'public'
-                AND table_type = 'BASE TABLE'
-                AND table_name NOT IN ('django_migrations', 'django_content_type',
-                    'auth_group', 'auth_group_permissions', 'auth_permission',
-                    'auth_user', 'auth_user_groups', 'auth_user_user_permissions',
-                    'django_admin_log', 'django_session',
-                    'query_history', 'conversation_sessions')
-                ORDER BY table_name
-            """)
-            table_names = [row[0] for row in cursor.fetchall()]
+        with connections['default'].cursor() as cursor:
+            table_names = self._get_table_names(cursor)
 
             for table_name in table_names:
                 columns = self._get_columns(cursor, table_name)
@@ -112,9 +171,17 @@ class SchemaInspector:
                         col['enum_values'] = enum_values[col['name']]
                     if col['name'] == pk:
                         col['pk'] = True
+                        col['is_pk'] = True
+                    fk_match = next((fk for fk in fks if fk['column'] == col['name']), None)
+                    if fk_match:
+                        col['is_fk'] = True
+                        col['references_table'] = fk_match['references_table']
+                        col['references_column'] = fk_match['references_column']
 
                 tables[table_name] = {
+                    'name': table_name,
                     'columns': columns,
+                    'column_count': len(columns),
                     'primary_key': pk,
                     'foreign_keys': fks,
                     'row_count': row_count,
@@ -133,6 +200,22 @@ class SchemaInspector:
         logger.info("Schema introspected: %d tables, %d relationships", len(tables), len(relationships))
         return {'tables': tables, 'relationships': relationships}
 
+    # ------------------------------------------------------------------
+    # PostgreSQL-specific helpers
+    # ------------------------------------------------------------------
+
+    def _get_table_names(self, cursor):
+        """Get user-created table names, excluding Django internals."""
+        placeholders = ', '.join(['%s'] * len(EXCLUDED_TABLES))
+        cursor.execute(f"""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'public'
+            AND table_type = 'BASE TABLE'
+            AND table_name NOT IN ({placeholders})
+            ORDER BY table_name
+        """, list(EXCLUDED_TABLES))
+        return [row[0] for row in cursor.fetchall()]
+
     def _get_columns(self, cursor, table_name):
         cursor.execute("""
             SELECT column_name, data_type, is_nullable, column_default
@@ -147,6 +230,10 @@ class SchemaInspector:
                 'nullable': row[2] == 'YES',
                 'default': row[3],
                 'pk': False,
+                'is_pk': False,
+                'is_fk': False,
+                'references_table': None,
+                'references_column': None,
             }
             for row in cursor.fetchall()
         ]
@@ -157,7 +244,7 @@ class SchemaInspector:
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
                 ON tc.constraint_name = kcu.constraint_name
-                AND tc.table_schema = kcu.table_schema
+                AND tc.constraint_schema = kcu.constraint_schema
             WHERE tc.table_schema = 'public'
             AND tc.table_name = %s
             AND tc.constraint_type = 'PRIMARY KEY'
@@ -175,10 +262,10 @@ class SchemaInspector:
             FROM information_schema.table_constraints tc
             JOIN information_schema.key_column_usage kcu
                 ON tc.constraint_name = kcu.constraint_name
-                AND tc.table_schema = kcu.table_schema
+                AND tc.constraint_schema = kcu.constraint_schema
             JOIN information_schema.constraint_column_usage ccu
                 ON tc.constraint_name = ccu.constraint_name
-                AND tc.table_schema = ccu.table_schema
+                AND tc.constraint_schema = ccu.constraint_schema
             WHERE tc.table_schema = 'public'
             AND tc.table_name = %s
             AND tc.constraint_type = 'FOREIGN KEY'
@@ -204,7 +291,8 @@ class SchemaInspector:
     def _get_enum_values(self, cursor, table_name, columns):
         enum_values = {}
         for col in columns:
-            if col['type'] in ('character varying', 'text') and not col['name'].endswith(('_id', 'email', 'name', 'description', 'comment')):
+            col_type = col['type'].lower()
+            if col_type in ('character varying', 'text', 'varchar') and not col['name'].endswith(('_id', 'email', 'name', 'description', 'comment')):
                 try:
                     cursor.execute(
                         f'SELECT DISTINCT "{col["name"]}" FROM "{table_name}" '
@@ -248,6 +336,13 @@ class SchemaInspector:
                     f"{rel['to_table']}.{rel['to_column']} ({rel['cardinality']})"
                 )
             lines.append(f"Relationships: {'; '.join(rel_parts)}.")
+
+        # Add user isolation note for the LLM
+        lines.append(
+            "NOTE: Tables customers, products, orders, reviews have a user_id column. "
+            "The categories table does NOT have user_id. "
+            "order_items inherits user scope through orders (JOIN orders ON order_items.order_id = orders.id)."
+        )
 
         sample_lines = []
         for table_name, table_info in tables.items():

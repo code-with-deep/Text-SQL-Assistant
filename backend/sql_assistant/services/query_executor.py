@@ -16,12 +16,19 @@ def _serialize_value(val):
     return val
 
 
+def _readonly_alias():
+    """Return the alias to use for read-only queries."""
+    return 'readonly' if 'readonly' in settings.DATABASES else 'default'
+
+
 class QueryExecutor:
 
     def execute(self, sql):
         start = time.perf_counter()
+        alias = _readonly_alias()
 
-        with connections['readonly'].cursor() as cursor:
+        with connections[alias].cursor() as cursor:
+            # Enforce PostgreSQL statement timeout
             cursor.execute(f"SET statement_timeout = '{settings.QUERY_TIMEOUT_SECONDS}s'")
             cursor.execute(sql)
 
@@ -30,7 +37,10 @@ class QueryExecutor:
 
         elapsed_ms = int((time.perf_counter() - start) * 1000)
 
-        rows = [[_serialize_value(v) for v in row] for row in raw_rows]
+        rows = [
+            {columns[i]: _serialize_value(v) for i, v in enumerate(row)}
+            for row in raw_rows
+        ]
 
         logger.info("Query executed — %d rows in %dms", len(rows), elapsed_ms)
         return {

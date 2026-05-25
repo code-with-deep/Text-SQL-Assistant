@@ -1,19 +1,27 @@
 import logging
 import uuid
+from django.conf import settings
+from django.contrib.auth import authenticate, get_user_model
+from django.db import IntegrityError
+from django.utils.text import capfirst
 from rest_framework import viewsets, status, mixins
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.views import exception_handler
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from django.http import HttpResponse
 from django.db import connections
 
 from sql_assistant.models import QueryHistory
 from sql_assistant.serializers import (
+    RegisterSerializer,
+    LoginSerializer,
     QueryRequestSerializer,
     ManualSQLRequestSerializer,
     QueryHistorySerializer
 )
+from sql_assistant.auth_tokens import TokenError, create_token, decode_token
 from sql_assistant.services import (
     SchemaInspector,
     NLToSQL,
@@ -23,7 +31,9 @@ from sql_assistant.services import (
     ChartDetector,
     ConversationManager,
     SuggestionGenerator,
-    ExportEngine
+    ExportEngine,
+    IntentDetector,
+    UserDataSeeder,
 )
 
 logger = logging.getLogger('sql_assistant')
@@ -41,14 +51,146 @@ def custom_exception_handler(exc, context):
         response = Response(
             {
                 'detail': 'An unexpected server error occurred.',
-                'error': str(exc)
+                'code': 'INTERNAL_SERVER_ERROR',
             },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
     return response
 
 
+def _user_payload(user):
+    return {
+        'id': str(user.id),
+        'name': user.get_full_name() or user.username,
+        'email': user.email,
+    }
+
+
+def _auth_response(user, status_code=status.HTTP_200_OK):
+    access_token = create_token(user, 'access')
+    refresh_token = create_token(user, 'refresh')
+    response = Response(
+        {
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'user': _user_payload(user),
+        },
+        status=status_code,
+    )
+    response.set_cookie(
+        'refresh_token',
+        refresh_token,
+        max_age=7 * 24 * 60 * 60,
+        httponly=True,
+        secure=not getattr(settings, 'DEBUG', False),
+        samesite='Lax',
+        path='/',
+    )
+    return response
+
+
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = RegisterSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        name = serializer.validated_data['name'].strip()
+        email = serializer.validated_data['email'].lower()
+        password = serializer.validated_data['password']
+
+        User = get_user_model()
+        first_name, _, last_name = name.partition(' ')
+        try:
+            user = User.objects.create_user(
+                username=email,
+                email=email,
+                password=password,
+                first_name=first_name,
+                last_name=last_name,
+            )
+        except IntegrityError:
+            return Response(
+                {'email': ['A user with this email already exists.']},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Auto-seed ecommerce data so the user can query immediately
+        try:
+            UserDataSeeder(user).seed()
+        except Exception as e:
+            logger.error("Failed to seed data for new user %s: %s", user.pk, str(e))
+            # Don't block signup if seeding fails — user can still log in
+
+        return _auth_response(user, status.HTTP_201_CREATED)
+
+
+class LoginView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        serializer = LoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data['email'].lower()
+        password = serializer.validated_data['password']
+        user = authenticate(request, username=email, password=password)
+        if user is None:
+            return Response({'detail': 'Invalid email or password.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        return _auth_response(user)
+
+
+class RefreshTokenView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        refresh_token = request.COOKIES.get('refresh_token') or request.data.get('refresh_token')
+        if not refresh_token:
+            return Response({'detail': 'Refresh token is required.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        try:
+            payload = decode_token(refresh_token, expected_type='refresh')
+        except TokenError as exc:
+            response = Response({'detail': capfirst(str(exc))}, status=status.HTTP_401_UNAUTHORIZED)
+            response.delete_cookie('refresh_token', path='/')
+            return response
+
+        User = get_user_model()
+        try:
+            user = User.objects.get(id=payload['sub'], is_active=True)
+        except User.DoesNotExist:
+            response = Response({'detail': 'User not found.'}, status=status.HTTP_401_UNAUTHORIZED)
+            response.delete_cookie('refresh_token', path='/')
+            return response
+
+        return _auth_response(user)
+
+
+class LogoutView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        response = Response({'detail': 'Logged out successfully.'}, status=status.HTTP_200_OK)
+        response.delete_cookie('refresh_token', path='/')
+        return response
+
+
+class MeView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(_user_payload(request.user))
+
+
 class SchemaViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
+
     """
     Provides introspection endpoints to access schema summaries,
     table details, statistics, and example question suggestions.
@@ -68,9 +210,10 @@ class SchemaViewSet(viewsets.ViewSet):
         """
         GET /api/schema/tables/{table_name}/
         Returns specific column statistics and preview rows for the specified table.
+        Data is filtered by user_id for user-scoped tables.
         """
         inspector = SchemaInspector()
-        table_detail = inspector.get_table_detail(table_name)
+        table_detail = inspector.get_table_detail(table_name, user_id=request.user.id)
         if not table_detail:
             return Response(
                 {'detail': f"Table '{table_name}' was not found in schema."},
@@ -90,6 +233,8 @@ class SchemaViewSet(viewsets.ViewSet):
 
 
 class QueryViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
+
     """
     Coordinates the natural language to SQL generation, validation, 
     execution, explanation, and visualization pipeline.
@@ -107,6 +252,9 @@ class QueryViewSet(viewsets.ViewSet):
         question = serializer.validated_data['question']
         conversation_id = serializer.validated_data['conversation_id']
 
+        # user_id ALWAYS comes from JWT token, never from request body
+        user_id = request.user.id
+
         # Initialize services
         schema_inspector = SchemaInspector()
         nl_to_sql = NLToSQL()
@@ -115,23 +263,62 @@ class QueryViewSet(viewsets.ViewSet):
         chart_detector = ChartDetector()
         query_explainer = QueryExplainer()
         conversation_mgr = ConversationManager()
+        intent_detector = IntentDetector()
 
-        # Load context
+        session = conversation_mgr.get_or_create_session(conversation_id, request.user)
+        conversation_id = session.id
+
         schema_summary = schema_inspector.get_prompt_summary()
-        conversation_context = conversation_mgr.get_context(conversation_id)
+        conversation_context = conversation_mgr.get_context(conversation_id, request.user)
+
+        # 0. Intent Detection
+        intent_category, intent_reason = intent_detector.detect(question)
+        if intent_category != 'SAFE_DATABASE_QUERY':
+            error_msg = "Your query could not be processed."
+            if intent_category == 'DESTRUCTIVE_QUERY':
+                error_msg = "Destructive operations are not permitted. This system only supports read-only data queries."
+            elif intent_category == 'NON_DATABASE_QUERY':
+                error_msg = "I am a database assistant and can only answer questions related to your data."
+            elif intent_category == 'PROMPT_INJECTION':
+                error_msg = "Invalid query structure detected."
+            elif intent_category == 'COMPANY_DATA_QUERY':
+                error_msg = "You are only permitted to query your own personal data. Company-wide data access is restricted."
+            elif intent_category == 'UNKNOWN':
+                error_msg = "The intent of your query could not be determined. Please rephrase."
+                
+            # Log blocked query
+            QueryHistory.objects.create(
+                question=question,
+                generated_sql="",
+                is_successful=False,
+                error_message=f"Blocked by Intent Guard: {intent_category} - {intent_reason}",
+                safety_report={"intent_category": intent_category, "intent_reason": intent_reason},
+                conversation_id=conversation_id,
+                user=request.user,
+            )
+            return Response(
+                {
+                    'detail': error_msg,
+                    'code': 'BLOCKED_INTENT',
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
         # 1. Generate SQL
         try:
-            generated_sql = nl_to_sql.generate(question, schema_summary, conversation_context)
+            generated_sql = nl_to_sql.generate(question, schema_summary, user_id, conversation_context)
         except Exception as e:
             logger.error("LLM SQL generation failed: %s", str(e), exc_info=True)
             return Response(
-                {'detail': 'Failed to translate question into SQL using the AI engine.', 'error': str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {
+                    'detail': 'AI SQL generation is unavailable. Verify GROQ_API_KEY and try again.',
+                    'code': 'LLM_UNAVAILABLE',
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
             )
 
         # 2. Validate SQL
-        is_safe, validated_sql, safety_error, safety_report = sql_validator.validate(generated_sql)
+        is_safe, validated_sql, safety_error, safety_report = sql_validator.validate(generated_sql, user_id=user_id)
         if not is_safe:
             # Log failed validation attempt
             QueryHistory.objects.create(
@@ -140,7 +327,8 @@ class QueryViewSet(viewsets.ViewSet):
                 is_successful=False,
                 error_message=f"Safety violation: {safety_error}",
                 safety_report=safety_report,
-                conversation_id=conversation_id
+                conversation_id=conversation_id,
+                user=request.user,
             )
             return Response(
                 {
@@ -166,7 +354,7 @@ class QueryViewSet(viewsets.ViewSet):
             # Retry mechanism: Ask LLM to correct its own query
             try:
                 fixed_sql = nl_to_sql.fix_sql(validated_sql, db_error_message, schema_summary)
-                is_safe, re_validated_sql, safety_error, safety_report = sql_validator.validate(fixed_sql)
+                is_safe, re_validated_sql, safety_error, safety_report = sql_validator.validate(fixed_sql, user_id=user_id)
                 
                 if is_safe:
                     validated_sql = re_validated_sql
@@ -190,7 +378,8 @@ class QueryViewSet(viewsets.ViewSet):
                 is_successful=False,
                 error_message=db_error_message,
                 safety_report=safety_report,
-                conversation_id=conversation_id
+                conversation_id=conversation_id,
+                user=request.user,
             )
             return Response(
                 {
@@ -240,12 +429,9 @@ class QueryViewSet(viewsets.ViewSet):
             result_rows=row_count,
             execution_ms=exec_ms,
             is_successful=True,
-            conversation_id=conversation_id
+            conversation_id=conversation_id,
+            user=request.user,
         )
-
-        # Ensure ConversationSession is linked
-        if conversation_id:
-            conversation_mgr.get_or_create_session(conversation_id)
 
         # Build response payload
         return Response(
@@ -261,7 +447,7 @@ class QueryViewSet(viewsets.ViewSet):
                 'chart_config': chart_config,
                 'safety_report': safety_report,
                 'execution_ms': exec_ms,
-                'conversation_id': conversation_id or history_record.conversation_id
+                'conversation_id': conversation_id
             },
             status=status.HTTP_200_OK
         )
@@ -278,14 +464,18 @@ class QueryViewSet(viewsets.ViewSet):
 
         sql_input = serializer.validated_data['sql']
         conversation_id = serializer.validated_data['conversation_id']
+        user_id = request.user.id
 
         sql_validator = SQLValidator()
         query_executor = QueryExecutor()
         chart_detector = ChartDetector()
         query_explainer = QueryExplainer()
 
-        # 1. Validate SQL
-        is_safe, validated_sql, safety_error, safety_report = sql_validator.validate(sql_input)
+        conversation_mgr = ConversationManager()
+        session = conversation_mgr.get_or_create_session(conversation_id, request.user)
+        conversation_id = session.id
+
+        is_safe, validated_sql, safety_error, safety_report = sql_validator.validate(sql_input, user_id=user_id)
         if not is_safe:
             return Response(
                 {
@@ -313,10 +503,19 @@ class QueryViewSet(viewsets.ViewSet):
         row_count = execution_results['row_count']
         exec_ms = execution_results['execution_ms']
 
-        # 3. Detect and explain
-        chart_config = chart_detector.detect(columns, rows)
-        explanation_data = query_explainer.explain(validated_sql)
-        explanation = explanation_data.get('summary', '')
+        try:
+            chart_config = chart_detector.detect(columns, rows)
+        except Exception as e:
+            logger.error("Chart detection failed: %s", str(e))
+            chart_config = {'chart_type': 'table', 'x_axis': None, 'y_axis': None, 'metrics': None, 'title': 'Data Table'}
+
+        try:
+            explanation_data = query_explainer.explain(validated_sql)
+            explanation = explanation_data.get('summary', '')
+        except Exception as e:
+            logger.error("Query explanation failed: %s", str(e))
+            explanation_data = {'summary': 'This query fetches the requested data from the database.', 'steps': []}
+            explanation = explanation_data['summary']
 
         # Keep subset preview
         preview_limit = 100
@@ -338,7 +537,8 @@ class QueryViewSet(viewsets.ViewSet):
             result_rows=row_count,
             execution_ms=exec_ms,
             is_successful=True,
-            conversation_id=conversation_id
+            conversation_id=conversation_id,
+            user=request.user,
         )
 
         return Response(
@@ -363,15 +563,18 @@ class QueryViewSet(viewsets.ViewSet):
 class HistoryViewSet(mixins.ListModelMixin,
                      mixins.RetrieveModelMixin,
                      viewsets.GenericViewSet):
+    permission_classes = [IsAuthenticated]
+
     """
     Exposes paginated endpoints to inspect past query history logs, 
     with capabilities to search and bookmark favorites.
     """
     queryset = QueryHistory.objects.all()
     serializer_class = QueryHistorySerializer
+    pagination_class = None
 
     def get_queryset(self):
-        queryset = QueryHistory.objects.all()
+        queryset = QueryHistory.objects.filter(user=self.request.user)
         
         # Apply filters
         search = self.request.query_params.get('search')
@@ -415,6 +618,8 @@ class HistoryViewSet(mixins.ListModelMixin,
 
 
 class ExportView(APIView):
+    permission_classes = [IsAuthenticated]
+
     """
     Generates high-performance CSV and styled Excel downloads from executed queries.
     """
@@ -432,9 +637,10 @@ class ExportView(APIView):
         if not sql:
             return Response({'detail': 'SQL query string is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 1. Validate SQL
+        # 1. Validate SQL (enforce user_id scope)
+        user_id = request.user.id
         sql_validator = SQLValidator()
-        is_safe, validated_sql, safety_error, _ = sql_validator.validate(sql)
+        is_safe, validated_sql, safety_error, _ = sql_validator.validate(sql, user_id=user_id)
         if not is_safe:
             return Response({'detail': f"SQL safety check failed: {safety_error}"}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -473,6 +679,8 @@ class ExportView(APIView):
 
 
 class HealthView(APIView):
+    permission_classes = [AllowAny]
+
     """
     Performs quick heartbeats on primary and read-only connections.
     """
@@ -488,18 +696,21 @@ class HealthView(APIView):
         # Check default DB connection
         try:
             connections['default'].ensure_connection()
-            services_status['postgres_default'] = 'connected'
+            services_status['db_default'] = 'connected'
         except Exception as e:
-            services_status['postgres_default'] = f"failed: {str(e)}"
+            services_status['db_default'] = f"failed: {str(e)}"
             overall_status = "error"
 
         # Check read-only DB connection
+        readonly_alias = 'readonly' if 'readonly' in settings.DATABASES else 'default'
         try:
-            connections['readonly'].ensure_connection()
-            services_status['postgres_readonly'] = 'connected'
+            connections[readonly_alias].ensure_connection()
+            services_status['db_readonly'] = 'connected'
         except Exception as e:
-            services_status['postgres_readonly'] = f"failed: {str(e)}"
+            services_status['db_readonly'] = f"failed: {str(e)}"
             overall_status = "error"
+
+        services_status['llm_configured'] = bool(settings.GROQ_API_KEY)
 
         http_status = status.HTTP_200_OK if overall_status == "ok" else status.HTTP_503_SERVICE_UNAVAILABLE
 

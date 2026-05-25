@@ -27,8 +27,8 @@ class ChartDetector:
 
         # Gather column characteristics
         col_types = []  # List of ('numeric' | 'temporal' | 'categorical')
-        for i, col in enumerate(columns):
-            col_types.append(self._infer_column_type(col, [r[i] for r in rows]))
+        for col in columns:
+            col_types.append(self._infer_column_type(col, [r.get(col) for r in rows]))
 
         numeric_indices = [i for i, t in enumerate(col_types) if t == 'numeric']
         temporal_indices = [i for i, t in enumerate(col_types) if t == 'temporal']
