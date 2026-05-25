@@ -1,12 +1,12 @@
 import os
 from pathlib import Path
 
-from decouple import Config, RepositoryEnv, Csv
+from decouple import AutoConfig, Csv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Explicitly load .env from the backend directory
-config = Config(RepositoryEnv(BASE_DIR / '.env'))
+# Load .env if it exists, otherwise fall back to system environment variables
+config = AutoConfig(search_path=BASE_DIR)
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = config('DJANGO_SECRET_KEY', default='insecure-dev-key-change-in-production')
